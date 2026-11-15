@@ -161,20 +161,53 @@ jobs:
           echo "===== ksu_extra_config.sh ====="
           cat ksu_extra_config.sh
 
-      - name: 9. 全量编译（AOSP + MIUI 两遍）
+      - name: 8d. Nova 源码 4.19 兼容补丁（access_ok / 预初始化宏 / 警告降级）
+        working-directory: kernel
+        run: |
+          set -e
+          sed -i '1i ccflags-y += -Wno-error' KernelSU/kernel/Makefile
+          sed -i 's|^#define KSU_NO_PREINIT$|#ifndef KSU_NO_PREINIT\n#define KSU_NO_PREINIT\n#endif|' KernelSU/kernel/preinit/common/preinit.h
+          sed -i 's|access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))|access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))|' KernelSU/kernel/extension/kpm/kpm.c
+          echo "===== Makefile 首行 ====="
+          head -3 KernelSU/kernel/Makefile
+          echo "===== preinit.h 4-10 行 ====="
+          sed -n '4,10p' KernelSU/kernel/preinit/common/preinit.h
+          echo "===== kpm.c access_ok ====="
+          grep -n "access_ok" KernelSU/kernel/extension/kpm/kpm.c
+          echo "===== 全仓库剩余的两参数 access_ok ====="
+          grep -rn "access_ok(" KernelSU/kernel | grep -v "VERIFY_" || echo "无"
+
+      - name: 9a. 全量编译（按输入配置，KPM 可能 on）
+        id: build_a
+        continue-on-error: true
         working-directory: kernel
         run: |
           set -o pipefail
           export CCACHE_DIR="$HOME/.cache/ccache_mikernel"
           ccache -M 4G || true
+          bash build.sh umi ksu 2>&1 | tee ../build_a.log
+
+      - name: 9b. 若 9a 失败：自动关掉 KPM 再跑一遍
+        if: steps.build_a.outcome == 'failure'
+        working-directory: kernel
+        env:
+          KSU_KPM_MODE: "off"
+        run: |
+          set -o pipefail
+          export CCACHE_DIR="$HOME/.cache/ccache_mikernel"
+          echo "[i] 第一次编译失败，自动切到 KPM=off 重试"
           bash build.sh umi ksu 2>&1 | tee ../build.log
 
       - name: 10. 产物自检
         working-directory: kernel
         run: |
           ls -lh Kernel_*.zip
-          grep -m3 "SukiSU-Nova version:" ../build.log || true
-          grep -E "AOSP Build successfully|MIUI Build successfully" ../build.log || true
+          for f in ../build_a.log ../build.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f ====="
+            grep -m2 "SukiSU-Nova version:" "$f" || true
+            grep -E "AOSP Build successfully|MIUI Build successfully" "$f" || true
+          done
           for z in Kernel_*.zip; do
             unzip -p "$z" kernels/Image > /tmp/img.bin
             echo "--- $z"
@@ -190,17 +223,17 @@ jobs:
           mkdir -p ../artifacts/modules
           cp Kernel_*.zip ../artifacts/ 2>/dev/null || true
           find out -name '*.ko' -print0 2>/dev/null | xargs -0 -r cp --parents -t ../artifacts/modules/ 2>/dev/null || true
-          cp ../build.log ../artifacts/ 2>/dev/null || true
+          cp ../build.log ../build_a.log ../artifacts/ 2>/dev/null || true
 
       - name: 12. 失败时捞错误
         if: failure()
         run: |
           echo "===== 编译错误 ====="
-          grep -nE "error:|Error [0-9]+|undefined reference|implicit declaration|No such file|fatal error" build.log | tail -40 || echo "无典型错误行"
+          for f in build_a.log build.log; do [ -f "$f" ] || continue; echo "== $f"; grep -nE "error:|Error [0-9]+|undefined reference|implicit declaration|fatal error" "$f" | tail -25 || true; done
           echo "===== KSU 相关 ====="
-          grep -nE "KernelSU|kernelsu|ksu_|SukiSU-Nova|SUSFS" build.log | tail -30 || true
+          grep -nE "KernelSU|ksu_|SukiSU-Nova|SUSFS|extra config" build_a.log build.log 2>/dev/null | tail -30 || true
           echo "===== 尾部 ====="
-          tail -30 build.log || true
+          tail -20 build.log 2>/dev/null || tail -20 build_a.log || true
 
       - name: 13. 上传
         if: always()
