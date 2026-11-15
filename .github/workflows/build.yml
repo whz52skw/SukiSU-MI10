@@ -117,6 +117,21 @@ jobs:
           done
           grep -n '^#if 0' fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c || echo "无停用"
 
+      - name: 8b. 4.19 兼容修补（屏蔽本树不存在的 static_call.h）
+        working-directory: kernel
+        run: |
+          set -e
+          echo "===== KSU 引用了、但本树里没有的 linux/ 头文件 ====="
+          for h in $(grep -rhoE '^#include <linux/[a-z0-9_]+\.h>' KernelSU/kernel | sed 's/#include <//; s/>//' | sort -u); do
+            [ -f "include/$h" ] || echo "  缺失: $h"
+          done
+          if [ ! -f include/linux/static_call.h ]; then
+            echo "本树没有 linux/static_call.h（5.10 才引入），给 KSU 的 include 加版本保护"
+            sed -i 's|^#include <linux/static_call.h>$|#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n#include <linux/static_call.h>\n#endif|' KernelSU/kernel/kernel_includes.h
+          fi
+          echo "===== 修补后的 include 片段 ====="
+          grep -n -B1 -A1 'static_call' KernelSU/kernel/kernel_includes.h || echo "未找到 static_call（可能已被替换）"
+
       - name: 9. 全量编译（AOSP 一遍 + MIUI 一遍）
         working-directory: kernel
         run: |
