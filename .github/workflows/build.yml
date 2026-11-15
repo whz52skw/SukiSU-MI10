@@ -1,0 +1,169 @@
+name: umi-full-nova
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: "SukiSU 引用：builtin=非GKI手动hook（推荐）；v3.0.0=main(kprobe)树"
+        required: true
+        default: "builtin"
+      hook_mode:
+        description: "auto=自动适配 hook；manual=完全不动；off=停用全部手动 hook"
+        required: true
+        default: "auto"
+        type: choice
+        options: ["auto", "manual", "off"]
+      kpm_patch:
+        description: "KPM patch_linux 版本"
+        required: true
+        default: "0.12.0"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      KSU_REF: ${{ github.event.inputs.ksu_ref }}
+      HOOK_MODE: ${{ github.event.inputs.hook_mode }}
+      KPM_PATCH: ${{ github.event.inputs.kpm_patch }}
+    steps:
+      - name: 1. 拉内核源
+        uses: actions/checkout@v4
+        with:
+          repository: liyafe1997/kernel_xiaomi_sm8250_mod
+          ref: android15-lineage22-mod
+          path: kernel
+          fetch-depth: 1
+
+      - name: 2. 腾磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/lib/jvm /opt/az
+          sudo apt-get clean
+          df -h /
+
+      - name: 3. 装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git curl wget bison flex zip unzip \
+            bc cpio libssl-dev ccache python-is-python3 python3 libelf-dev \
+            device-tree-compiler gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            lz4 zstd xz-utils rsync kmod file
+
+      - name: 4. 缓存工具链
+        id: tc
+        uses: actions/cache@v4
+        with:
+          path: ~/proton-clang
+          key: proton-clang-20210522-v1
+
+      - name: 5. 下载 proton-clang
+        if: steps.tc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/proton-clang" && cd "$HOME/proton-clang"
+          for i in 1 2 3 4 5 6; do
+            wget -q --tries=3 --retry-connrefused --waitretry=8 \
+              https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip && break
+            echo "[retry $i]"; sleep 15
+          done
+          unzip -q 20210522.zip
+          test -x proton-clang-20210522/bin/clang
+
+      - name: 6. 指向 Nova + 改 KSU ref + 锁 KPM 补丁版本
+        working-directory: kernel
+        run: |
+          set -e
+          sed -i 's#https://github.com/liyafe1997/SukiSU-Ultra/raw/[0-9a-f]*/kernel/setup.sh#https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh#' build.sh
+          sed -i "s#bash -s [0-9a-f]\\{40\\}#bash -s ${KSU_REF}#" build.sh
+          sed -i "s#SukiSU_KernelPatch_patch/releases/download/0.12.0/#SukiSU_KernelPatch_patch/releases/download/${KPM_PATCH}/#" build.sh
+          grep -n "setup.sh\|bash -s\|KernelPatch" build.sh
+
+      - name: 7. 预装 Nova KSU + 预测内核侧版本号
+        working-directory: kernel
+        run: |
+          set -e
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" | bash -s "${KSU_REF}"
+          cd KernelSU
+          git log -1 --format='当前 KSU 提交: %h %ad %s' --date=short
+          echo "分支: $(git rev-parse --abbrev-ref HEAD)"
+          CNT=$(git rev-list --count main 2>/dev/null || echo 0)
+          echo "main 提交数 = $CNT"
+          echo "预测 KSU_VERSION = $((30000 + CNT - 4001))  # 必须大于 13251"
+
+      - name: 8. 自动适配 hook（改名 / 停用缺失符号）
+        if: env.HOOK_MODE != 'manual'
+        working-directory: kernel
+        run: |
+          set -e
+          test -d KernelSU/kernel
+          BLOB=$(find KernelSU/kernel -type f \\( -name '*.h' -o -name '*.c' \\) -exec cat {} +)
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c; do
+            sed -i 's/ksu_handle_execveat(/ksu_handle_execveat_ksud(/g' "$f"
+            missing=""
+            for sym in $(grep -hoE 'ksu_[a-z0-9_]+' "$f" | sort -u); do
+              printf '%s' "$BLOB" | grep -q "$sym" || missing="$missing $sym"
+            done
+            if [ -n "$missing" ] || [ "$HOOK_MODE" = "off" ]; then
+              echo "$f: 停用 hook 块 (缺失:${missing:- 强制停用})"
+              sed -i 's|^[[:space:]]*#ifdef CONFIG_KSU[[:space:]]*$|#if 0|' "$f"
+              sed -i 's|^[[:space:]]*#if defined(CONFIG_KSU)[[:space:]]*$|#if 0|' "$f"
+            else
+              echo "$f: 保留（符号齐全）"
+            fi
+          done
+          echo "===== 停用结果 ====="
+          grep -n "^#if 0" fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c || echo "无停用"
+
+      - name: 9. 全量编译（AOSP 一遍 + MIUI 一遍）
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          export CCACHE_DIR="$HOME/.cache/ccache_mikernel"
+          ccache -M 4G || true
+          bash build.sh umi ksu 2>&1 | tee ../build.log
+
+      - name: 10. 产物自检
+        working-directory: kernel
+        run: |
+          ls -lh Kernel_*.zip
+          grep -m2 "SukiSU-Nova version:" ../build.log || true
+          grep -E "AOSP Build successfully|MIUI Build successfully" ../build.log || true
+          for z in Kernel_*.zip; do
+            unzip -p "$z" kernels/Image > /tmp/img.bin
+            echo "--- $z"
+            echo "  size        : $(stat -c%s /tmp/img.bin)"
+            echo "  linux ver   : $(strings /tmp/img.bin | grep -m1 'Linux version')"
+            echo "  ksu version : $(strings /tmp/img.bin | grep -m1 'SukiSU-Nova' || true)"
+            echo "  sukisu syms : $(strings /tmp/img.bin | grep -c 'sukisu_kpm' || true)"
+            echo "  susfs       : $(strings /tmp/img.bin | grep -c 'susfs:' || true)"
+          done
+
+      - name: 11. 收集产物
+        if: always()
+        working-directory: kernel
+        run: |
+          mkdir -p ../artifacts
+          cp Kernel_*.zip ../artifacts/ 2>/dev/null || true
+          find out -name '*.ko' -exec cp --parents {} ../artifacts/modules/ \\; 2>/dev/null || true
+          cp ../build.log ../artifacts/ 2>/dev/null || true
+
+      - name: 12. 失败时捞错误
+        if: failure()
+        run: |
+          echo "===== 编译错误 ====="
+          grep -nE "error:|Error [0-9]+|undefined reference|too few arguments|implicit declaration|No such file" build.log | tail -40 || echo "无典型错误行"
+          echo "===== KSU 相关 ====="
+          grep -nE "KernelSU|kernelsu|ksu_|SukiSU-Nova" build.log | tail -30 || true
+          echo "===== 尾部 ====="
+          tail -40 build.log || true
+
+      - name: 13. 上传
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: umi-nova-${{ github.run_id }}-${{ env.KSU_REF }}-${{ env.HOOK_MODE }}
+          path: artifacts
+          retention-days: 30
