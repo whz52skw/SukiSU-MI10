@@ -20,9 +20,9 @@ on:
         type: choice
         options: ["off", "on"]
       kpm_mode:
-        description: "KPM：on/off"
+        description: "KPM：on/off（先 off 拿稳定版，root 通了再开）"
         required: true
-        default: "on"
+        default: "off"
         type: choice
         options: ["on", "off"]
       kpm_patch:
@@ -105,7 +105,6 @@ jobs:
         run: |
           set -e
           for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c; do
-            sed -i 's/ksu_handle_execveat(/ksu_handle_execveat_ksud(/g' "$f"
             missing=""
             for sym in $(grep -hoE 'ksu_[a-z0-9_]+' "$f" | sort -u); do
               if ! grep -rq -F "$sym" KernelSU/kernel; then
@@ -176,6 +175,17 @@ jobs:
           grep -n "access_ok" KernelSU/kernel/extension/kpm/kpm.c
           echo "===== 全仓库剩余的两参数 access_ok ====="
           grep -rn "access_ok(" KernelSU/kernel | grep -v "VERIFY_" || echo "无"
+
+      - name: 8e. execve hook 改回官方总入口（su 与 ksud 双处理）
+        working-directory: kernel
+        run: |
+          set -e
+          sed -i 's|if (unlikely(ksu_execveat_hook))|if (1)|' fs/exec.c
+          sed -i 's|if (!ksu_execveat_hook)|if (0)|' fs/exec.c
+          echo "===== exec.c 里的 hook 调用 ====="
+          grep -n "ksu_handle_execveat\|ksu_execveat_hook" fs/exec.c
+          echo "===== 确认没有 NULL argv 的 sucompat 调用 ====="
+          grep -n "sucompat((int \*)AT_FDCWD, &filename, NULL" fs/exec.c && echo "[!] 仍有 NULL 调用" || echo "无"
 
       - name: 9a. 全量编译（按输入配置，KPM 可能 on）
         id: build_a
