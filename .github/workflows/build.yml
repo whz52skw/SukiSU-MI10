@@ -25,6 +25,12 @@ on:
         default: "off"
         type: choice
         options: ["on", "off"]
+      kprobe_mode:
+        description: "kprobe 模式：切 main 树时必须 on（自动开 KPROBES/KRETPROBES）"
+        required: true
+        default: "off"
+        type: choice
+        options: ["off", "on"]
       kpm_patch:
         description: "KPM patch_linux 版本"
         required: true
@@ -42,6 +48,7 @@ jobs:
       HOOK_MODE: ${{ github.event.inputs.hook_mode }}
       KSU_SUSFS_MODE: ${{ github.event.inputs.susfs_mode }}
       KSU_KPM_MODE: ${{ github.event.inputs.kpm_mode }}
+      KSU_KPROBES: ${{ github.event.inputs.kprobe_mode }}
       KPM_PATCH: ${{ github.event.inputs.kpm_patch }}
     steps:
       - name: 1. 拉内核源
@@ -152,14 +159,15 @@ jobs:
             echo 'if [ "$KSU_KPM_MODE" = "off" ]; then'
             echo '  scripts/config --file out/.config -d KPM || true'
             echo 'fi'
-            echo 'echo "[i] extra config: SUSFS=$KSU_SUSFS_MODE KPM=$KSU_KPM_MODE"'
+            echo 'if [ "$KSU_KPROBES" = "on" ]; then'
+            echo '  scripts/config --file out/.config -e KPROBES -e KRETPROBES -e KPROBE_EVENTS || true'
+            echo 'fi'
+            echo 'echo "[i] extra config: SUSFS=$KSU_SUSFS_MODE KPM=$KSU_KPM_MODE KPROBES=$KSU_KPROBES"'
           } > ksu_extra_config.sh
           chmod +x ksu_extra_config.sh
           sed -i 's|^make \$MAKE_ARGS -j\$(nproc)$|sh ksu_extra_config.sh\nmake $MAKE_ARGS -j$(nproc)|' build.sh
-          grep -n "ksu_extra_config" build.sh
-          echo "===== ksu_extra_config.sh ====="
+          grep -n 'ksu_extra_config' build.sh
           cat ksu_extra_config.sh
-
       - name: 8d. Nova 源码 4.19 兼容补丁（access_ok / 预初始化宏 / 警告降级）
         working-directory: kernel
         run: |
