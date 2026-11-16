@@ -337,60 +337,33 @@ jobs:
 
           PY
           grep -n 'hard-allow' KernelSU/kernel/policy/allowlist.c || true
-      - name: 8j. 放开 feature 表 + 注册 10003 桩 + 查询日志
+      - name: 8j. 兼容 feature 10003（函数入口直接放行，不改表大小）
         id: s8j
         if: env.HOOK_PATCH == 'postexec'
         working-directory: kernel
         run: |
           set -ex
           python3 - <<'PY'
-          import re, io
-
-          # 1) 放开 feature 表上限（否则 10003 直接被判非法）
-          h = "KernelSU/kernel/include/uapi/feature.h"
-          t = open(h).read()
-          if "KSU_FEATURE_MAX = 16384" not in t:
-              t2 = re.sub(r"^\s*KSU_FEATURE_MAX\s*$", "    KSU_FEATURE_MAX = 16384", t, flags=re.M)
-              if t2 == t:
-                  print("feature.h MAX anchor missing")
-              else:
-                  open(h, "w").write(t2)
-                  print("feature.h MAX raised")
-          else:
-              print("feature.h already raised")
-
-          # 2) 给 feature.c 加查询日志（看清管理器到底问哪些 id）
           f = "KernelSU/kernel/policy/feature.c"
           c = open(f).read()
-          if "ksu: feature get id=" not in c:
-              c2 = c.replace("    if (!value || !supported) {", "    pr_info(\"ksu: feature get id=%u\\n\", feature_id);\n    if (!value || !supported) {", 1)
-              if c2 == c:
-                  print("feature.c log anchor missing")
-              else:
-                  open(f, "w").write(c2)
-                  print("feature.c instrumented")
-          else:
-              print("feature.c already instrumented")
 
-          # 3) 注册 10003 桩
-          k = "KernelSU/kernel/ksu_main.c"
-          s = open(k).read()
-          if "compat_10003" in s:
-              print("stub already patched")
+          if "compat feature 10003" in c:
+              print("already patched")
           else:
-              stub = "#ifdef CONFIG_KSU\nstatic int ksu_compat_feature_get(u64 *value) { *value = 1; return 0; }\nstatic int ksu_compat_feature_set(u64 value) { return 0; }\nstatic const struct ksu_feature_handler ksu_compat_feature_10003 = {\n    .feature_id = 10003,\n    .name = \"compat_10003\",\n    .get_handler = ksu_compat_feature_get,\n    .set_handler = ksu_compat_feature_set,\n};\n#endif\n\n"
-              anchor = "int __init kernelsu_init(void)"
-              if anchor not in s:
-                  print("kernelsu_init anchor missing")
+              get_old = "int ksu_get_feature(u32 feature_id, u64 *value, bool *supported)\n{\n"
+              get_new = get_old + "    if (feature_id == 10003) {\n        if (value)\n            *value = 1;\n        if (supported)\n            *supported = true;\n        pr_info(\"ksu: compat feature 10003 get\\n\");\n        return 0;\n    }\n\n"
+              set_old = "int ksu_set_feature(u32 feature_id, u64 value)\n{\n"
+              set_new = set_old + "    if (feature_id == 10003) {\n        pr_info(\"ksu: compat feature 10003 set\\n\");\n        return 0;\n    }\n\n"
+              if get_old not in c or set_old not in c:
+                  print("anchor missing -> skip")
               else:
-                  s = s.replace(anchor, stub + anchor, 1)
-                  s = s.replace("    ksu_feature_init();", "    ksu_feature_init();\n    ksu_register_feature_handler(&ksu_compat_feature_10003);", 1)
-                  open(k, "w").write(s)
-                  print("stub patched")
+                  c = c.replace(get_old, get_new, 1)
+                  c = c.replace(set_old, set_new, 1)
+                  open(f, "w").write(c)
+                  print("patched")
 
           PY
-          grep -n 'KSU_FEATURE_MAX = 16384' KernelSU/kernel/include/uapi/feature.h || true
-          grep -n 'compat_10003' KernelSU/kernel/ksu_main.c || true
+          grep -n 'compat feature 10003' KernelSU/kernel/policy/feature.c || true
       - name: 8f. ccache 缓存
         uses: actions/cache@v4
         with:
