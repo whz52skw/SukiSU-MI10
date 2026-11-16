@@ -25,6 +25,18 @@ on:
         default: "off"
         type: choice
         options: ["on", "off"]
+      hook_patch:
+        description: "A 路线：none=不补；postexec=补 execve 后置钩子（让 ksud 拿到驱动 fd）"
+        required: true
+        default: "none"
+        type: choice
+        options: ["none", "postexec"]
+      variant:
+        description: "编译变体：miui=只编 MIUI（省一半时间）；both=两遍都编"
+        required: true
+        default: "miui"
+        type: choice
+        options: ["miui", "both"]
       kprobe_mode:
         description: "kprobe 模式：切 main 树时必须 on（自动开 KPROBES/KRETPROBES）"
         required: true
@@ -48,6 +60,7 @@ jobs:
       HOOK_MODE: ${{ github.event.inputs.hook_mode }}
       KSU_SUSFS_MODE: ${{ github.event.inputs.susfs_mode }}
       KSU_KPM_MODE: ${{ github.event.inputs.kpm_mode }}
+      HOOK_PATCH: ${{ github.event.inputs.hook_patch }}
       KSU_KPROBES: ${{ github.event.inputs.kprobe_mode }}
       KPM_PATCH: ${{ github.event.inputs.kpm_patch }}
     steps:
@@ -95,6 +108,18 @@ jobs:
           sed -i 's#^\( *\)curl -LSs .*setup\.sh.*#\1echo "[i] KSU 已在步骤 7 预装，跳过 build.sh 内重复 setup"#' build.sh
           sed -i "s#SukiSU_KernelPatch_patch/releases/download/0.12.0/#SukiSU_KernelPatch_patch/releases/download/${KPM_PATCH}/#" build.sh
           grep -n "setup\|KernelPatch\|KSU is" build.sh
+
+      - name: 6b. 裁剪编译变体（默认只编 MIUI）
+        if: github.event.inputs.variant == 'miui'
+        working-directory: kernel
+        run: |
+          set -e
+          cp build.sh build.sh.full
+          sed -i '/Building for AOSP/,/End of Building for AOSP/d' build.sh
+          echo "===== 裁剪后仍然存在的 make 行 ====="
+          grep -n "make \$MAKE_ARGS" build.sh
+          echo "===== AOSP 段是否已删除 ====="
+          grep -c "Building for AOSP" build.sh || echo "0（已删除）"
 
       - name: 7. 预装 Nova KSU（builtin）
         working-directory: kernel
@@ -194,6 +219,58 @@ jobs:
           grep -n "ksu_handle_execveat\|ksu_execveat_hook" fs/exec.c
           echo "===== 确认没有 NULL argv 的 sucompat 调用 ====="
           grep -n "sucompat((int \*)AT_FDCWD, &filename, NULL" fs/exec.c && echo "[!] 仍有 NULL 调用" || echo "无"
+
+      - name: 8g. A 路线补丁：execve 后置钩子（ksud 拿驱动 fd）
+        if: env.HOOK_PATCH == 'postexec'
+        working-directory: kernel
+        run: |
+          set -e
+          python3 - <<'PY'
+          import re
+          p = 'fs/exec.c'
+          s = open(p).read()
+          if 'ksu_handle_post_execveat_sucompat' in s:
+              print('already patched, skip')
+          else:
+              anchor = 'extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,'
+              decl = 'extern int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr,\n\t\t\tvoid *argv, void *envp, int *flags, int *retval);\n'
+              if anchor not in s:
+                  print('anchor missing'); raise SystemExit(1)
+              s = s.replace(anchor, decl + anchor, 1)
+              newfn = '''int do_execve(struct filename *filename,
+          \tconst char __user *const __user *__argv,
+          \tconst char __user *const __user *__envp)
+          {
+          \tstruct user_arg_ptr argv = { .ptr.native = __argv };
+          \tstruct user_arg_ptr envp = { .ptr.native = __envp };
+          #ifdef CONFIG_KSU
+          \tint ksu_is_su;
+          \tint ksu_ret;
+
+          \tksu_is_su = (ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0) == 0);
+          \tksu_ret = do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
+          \tif (ksu_is_su && ksu_ret >= 0)
+          \t\tksu_handle_post_execveat_sucompat(0, 0, 0, 0, 0, &ksu_ret);
+          \treturn ksu_ret;
+          #else
+          \treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
+          #endif
+          }
+          '''
+              m = re.search(r'int do_execve\(struct filename \*filename,.*?\n\}\n', s, re.S)
+              if not m:
+                  print('do_execve not found'); raise SystemExit(1)
+              s = s[:m.start()] + newfn + s[m.end():]
+              open(p, 'w').write(s)
+              print('patched ok')
+          PY
+          echo '===== do_execve 现状 ====='
+          sed -n '/^int do_execve(struct filename/,/^}/p' fs/exec.c
+      - name: 8f. ccache 缓存（命中后编译提速一半以上）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache_mikernel
+          key: ccache-v2-${{ github.event.inputs.ksu_ref }}-${{ github.event.inputs.variant }}-${{ github.event.inputs.kprobe_mode }}-${{ github.event.inputs.susfs_mode }}
 
       - name: 9a. 全量编译（按输入配置，KPM 可能 on）
         id: build_a
