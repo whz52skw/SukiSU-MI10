@@ -315,6 +315,27 @@ jobs:
           sed -n '/^int do_execve(struct filename/,/^}/p' fs/exec.c || true
           echo '===== do_execveat_common ====='
           sed -n '/^static int do_execveat_common(int fd, struct filename/,/^}/p' fs/exec.c || true
+      - name: 8i. 诊断补丁（把管理器状态写到 /data/local/tmp/ksu_diag.txt）
+        id: s8i
+        if: env.HOOK_PATCH == 'postexec'
+        working-directory: kernel
+        run: |
+          set -ex
+          python3 - <<'PY'
+          p = "KernelSU/kernel/runtime/ksud.c"
+          s = open(p).read()
+          if "ksu_diag_dump" in s:
+              print("diag already patched")
+          else:
+              fn = "static void ksu_diag_dump(const char *tag)\n{\n    struct file *f;\n    char buf[192];\n    int n;\n\n    n = snprintf(buf, sizeof(buf),\n                 \"[%s] mgr_valid=%d mgr_appid=%d sucompat=%d allow_shell=%d\\n\",\n                 tag, ksu_is_manager_appid_valid(), ksu_get_manager_appid(),\n                 ksu_su_compat_enabled, allow_shell);\n    f = filp_open(\"/data/local/tmp/ksu_diag.txt\", O_WRONLY | O_CREAT | O_APPEND, 0644);\n    if (IS_ERR(f)) {\n        pr_err(\"ksu_diag: open failed %ld\\n\", PTR_ERR(f));\n        return;\n    }\n    kernel_write(f, buf, n, &f->f_pos);\n    filp_close(f, NULL);\n}\n\n"
+              s = s.replace("void on_post_fs_data(void)", fn + "void on_post_fs_data(void)", 1)
+              s = s.replace("    ksu_observer_init();", "    ksu_observer_init();\n    ksu_diag_dump(\"post_fs_data\");", 1)
+              s = s.replace("    track_throne(true);", "    track_throne(true);\n    ksu_diag_dump(\"boot_completed\");", 1)
+              open(p, "w").write(s)
+              print("diag patched")
+
+          PY
+          grep -n 'ksu_diag_dump' KernelSU/kernel/runtime/ksud.c || true
       - name: 8f. ccache 缓存
         uses: actions/cache@v4
         with:
@@ -402,6 +423,7 @@ jobs:
           echo "8e exec entry  : ${{ steps.s8e.outcome }}"
           echo "8g postexec    : ${{ steps.s8g.outcome }}"
           echo "8h main compat : ${{ steps.s8h.outcome }}"
+          echo "8i diag patch  : ${{ steps.s8i.outcome }}"
           echo "9a build       : ${{ steps.build_a.outcome }}"
           echo "============================================="
           exit 0
