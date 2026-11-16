@@ -4,45 +4,45 @@ on:
   workflow_dispatch:
     inputs:
       ksu_ref:
-        description: "SukiSU 引用（builtin=非GKI手动hook树）"
+        description: "builtin=手动hook树(A路线)；v3.0.0=main树(B路线)"
         required: true
         default: "builtin"
       hook_mode:
-        description: "auto=自动适配hook；manual=不动；off=停用全部手动hook"
+        description: "auto=保留exec/open/stat手动hook；off=全停用(配main树)"
         required: true
         default: "auto"
         type: choice
-        options: ["auto", "manual", "off"]
+        options: ["auto", "off"]
+      hook_patch:
+        description: "postexec=补execve后置钩子(A路线核心)"
+        required: true
+        default: "none"
+        type: choice
+        options: ["none", "postexec"]
+      kprobe_mode:
+        description: "on=自动开KPROBES/KRETPROBES/KPROBE_EVENTS(B路线)"
+        required: true
+        default: "off"
+        type: choice
+        options: ["off", "on"]
       susfs_mode:
-        description: "SUSFS：off=先关掉保证能编过；on=内核树SUSFS版本够新才用"
+        description: "SUSFS 开关"
         required: true
         default: "off"
         type: choice
         options: ["off", "on"]
       kpm_mode:
-        description: "KPM：on/off（先 off 拿稳定版，root 通了再开）"
+        description: "KPM 开关（先off）"
         required: true
         default: "off"
         type: choice
         options: ["on", "off"]
-      hook_patch:
-        description: "A 路线：none=不补；postexec=补 execve 后置钩子（让 ksud 拿到驱动 fd）"
-        required: true
-        default: "none"
-        type: choice
-        options: ["none", "postexec"]
       variant:
-        description: "编译变体：miui=只编 MIUI（省一半时间）；both=两遍都编"
+        description: "miui=只编MIUI(快一倍)；both=两遍"
         required: true
         default: "miui"
         type: choice
         options: ["miui", "both"]
-      kprobe_mode:
-        description: "kprobe 模式：切 main 树时必须 on（自动开 KPROBES/KRETPROBES）"
-        required: true
-        default: "off"
-        type: choice
-        options: ["off", "on"]
       kpm_patch:
         description: "KPM patch_linux 版本"
         required: true
@@ -58,10 +58,11 @@ jobs:
     env:
       KSU_REF: ${{ github.event.inputs.ksu_ref }}
       HOOK_MODE: ${{ github.event.inputs.hook_mode }}
-      KSU_SUSFS_MODE: ${{ github.event.inputs.susfs_mode }}
-      KSU_KPM_MODE: ${{ github.event.inputs.kpm_mode }}
       HOOK_PATCH: ${{ github.event.inputs.hook_patch }}
       KSU_KPROBES: ${{ github.event.inputs.kprobe_mode }}
+      KSU_SUSFS_MODE: ${{ github.event.inputs.susfs_mode }}
+      KSU_KPM_MODE: ${{ github.event.inputs.kpm_mode }}
+      VARIANT: ${{ github.event.inputs.variant }}
       KPM_PATCH: ${{ github.event.inputs.kpm_patch }}
     steps:
       - name: 1. 拉内核源
@@ -90,7 +91,7 @@ jobs:
           path: ~/proton-clang
           key: proton-clang-20210522-v1
 
-      - name: 5. 下载 proton-clang（三源重试，抗网络抖动）
+      - name: 5. 下载 proton-clang（三源重试）
         if: steps.tc.outputs.cache-hit != 'true'
         run: |
           set -x
@@ -100,34 +101,35 @@ jobs:
             https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip \
             https://gh-proxy.com/https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip \
             https://codeload.github.com/kdrag0n/proton-clang/zip/refs/tags/20210522 ; do
-            echo "[i] 尝试: $url"
+            echo "[i] try: $url"
             if wget -q --tries=2 --timeout=40 -O pc.zip "$url" && unzip -q -o pc.zip; then ok=1; break; fi
-            echo '[retry] 换下一个源'
+            echo "[retry] next mirror"
           done
-          test "$ok" = "1" || { echo '[x] 三个源都失败'; exit 1; }
-          test -x proton-clang-20210522/bin/clang || { echo '[x] 解压后找不到 clang'; exit 1; }
-          echo '[ok] 工具链就绪'
-      - name: 6. 关掉 build.sh 自带的 KSU setup（避免它 git stash 掉我们的补丁）
+          test "$ok" = "1" || { echo "[x] all mirrors failed"; exit 1; }
+          test -x proton-clang-20210522/bin/clang || { echo "[x] clang not found"; exit 1; }
+          echo "[ok] toolchain ready"
+
+      - name: 6. 关掉 build.sh 自带 setup
         id: s6
         working-directory: kernel
         run: |
-          set -e
-          sed -i 's#^\( *\)curl -LSs .*setup\.sh.*#\1echo "[i] KSU 已在步骤 7 预装，跳过 build.sh 内重复 setup"#' build.sh
+          set -x
+          sed -i "s#^\( *\)curl -LSs .*setup\.sh.*#\1echo [i] KSU-preinstalled#" build.sh
           sed -i "s#SukiSU_KernelPatch_patch/releases/download/0.12.0/#SukiSU_KernelPatch_patch/releases/download/${KPM_PATCH}/#" build.sh
-          grep -n "setup\|KernelPatch\|KSU is" build.sh
+          grep -n "curl -LSs" build.sh || echo "[ok] build.sh setup disabled"
 
-      - name: 6b. 裁剪编译变体（默认只编 MIUI）
+      - name: 6b. 裁剪成只编 MIUI
         id: s6b
-        if: github.event.inputs.variant == 'miui'
+        if: env.VARIANT == 'miui'
         working-directory: kernel
         run: |
-          set -e
+          set -x
           cp build.sh build.sh.full
-          sed -i '/Building for AOSP/,/End of Building for AOSP/d' build.sh
-          echo "===== 裁剪后仍然存在的 make 行 ====="
-          grep -n "make \$MAKE_ARGS" build.sh
-          echo "===== AOSP 段是否已删除 ====="
-          grep -c "Building for AOSP" build.sh || echo "0（已删除）"
+          sed -i '/^# ------------- Building for AOSP -------------$/,/^# ------------- End of Building for AOSP -------------$/d' build.sh
+          echo "===== remaining make lines ====="
+          grep -n "^make \$MAKE_ARGS" build.sh || true
+          echo "===== AOSP markers (should be 0) ====="
+          grep -c "^# ------------- Building for AOSP -------------$" build.sh || true
 
       - name: 7. 预装 Nova KSU（带重试）
         id: s7
@@ -141,111 +143,110 @@ jobs:
                && [ -s /tmp/ksu_setup.sh ]; then
               sh /tmp/ksu_setup.sh "$KSU_REF" && ok=1 && break
             fi
-            echo "[retry $i] KSU setup 失败"
+            echo "[retry $i] ksu setup failed"
             sleep 10
           done
-          test "$ok" = "1" || { echo '[x] KSU setup 三次都失败'; exit 1; }
-          test -d KernelSU/kernel || { echo '[x] KernelSU/kernel 不存在'; exit 1; }
+          test "$ok" = "1" || { echo "[x] ksu setup failed 3 times"; exit 1; }
+          test -d KernelSU/kernel || { echo "[x] KernelSU/kernel missing"; exit 1; }
           cd KernelSU
-          git log -1 --format='KSU 提交: %h %ad %s' --date=short
+          git log -1 --format="KSU commit: %h %ad %s" --date=short
           CNT=$(git rev-list --count HEAD 2>/dev/null || echo 0)
-          echo "预测 KSU_VERSION = $((30000 + CNT - 4001))"
-      - name: 8. 停用 Nova 里没有对应实现的两个 hook（确定性写法）
+          echo "predicted KSU_VERSION = $((30000 + CNT - 4001))"
+
+      - name: 8. 停用 Nova 缺失的 hook（确定性）
         id: s8
         working-directory: kernel
         run: |
           set -x
           pwd
           ls -d KernelSU/kernel
-          # Nova builtin 里没有 ksu_handle_sys_read / ksu_input_hook，这两个块必须停用
           for f in fs/read_write.c drivers/input/input.c; do
-            sed -i 's|^[[:space:]]*#ifdef CONFIG_KSU[[:space:]]*$|#if 0|' "$f"
-            sed -i 's|^[[:space:]]*#if defined(CONFIG_KSU)[[:space:]]*$|#if 0|' "$f"
-            echo "$f -> $(grep -c '^#if 0' "$f") 处已停用"
+            sed -i "s|^[[:space:]]*#ifdef CONFIG_KSU[[:space:]]*$|#if 0|" "$f"
+            sed -i "s|^[[:space:]]*#if defined(CONFIG_KSU)[[:space:]]*$|#if 0|" "$f"
+            echo "$f -> $(grep -c "^#if 0" "$f") blocks disabled"
           done
-          # hook_mode=off 时把剩下的三个也停掉（配合 main 树/kprobe 用）
           if [ "$HOOK_MODE" = "off" ]; then
             for f in fs/exec.c fs/open.c fs/stat.c; do
-              sed -i 's|^[[:space:]]*#ifdef CONFIG_KSU[[:space:]]*$|#if 0|' "$f"
-              sed -i 's|^[[:space:]]*#if defined(CONFIG_KSU)[[:space:]]*$|#if 0|' "$f"
-              echo "$f -> $(grep -c '^#if 0' "$f") 处已停用"
+              sed -i "s|^[[:space:]]*#ifdef CONFIG_KSU[[:space:]]*$|#if 0|" "$f"
+              sed -i "s|^[[:space:]]*#if defined(CONFIG_KSU)[[:space:]]*$|#if 0|" "$f"
+              echo "$f -> $(grep -c "^#if 0" "$f") blocks disabled"
             done
           else
-            echo 'hook_mode!=off：exec/open/stat 保留手动 hook'
+            echo "hook_mode!=off: keep exec/open/stat hooks"
           fi
-          grep -n '^#if 0' fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c || true
-      - name: 8b. 造 4.19 缺失头文件（static_call.h）
+          grep -n "^#if 0" fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c || true
+
+      - name: 8b. 造 4.19 缺失头文件 static_call.h
         id: s8b
         working-directory: kernel
         run: |
-          set -e
+          set -x
           if [ ! -f include/linux/static_call.h ]; then
             {
-              echo '/* 4.19 shim: Nova 只是 include 这个头，没有实际使用 static_call API */'
-              echo '#ifndef _KSU_STATIC_CALL_SHIM_H'
-              echo '#define _KSU_STATIC_CALL_SHIM_H'
-              echo '#endif'
+              echo "/* 4.19 shim: Nova only includes this header */"
+              echo "#ifndef _KSU_STATIC_CALL_SHIM_H"
+              echo "#define _KSU_STATIC_CALL_SHIM_H"
+              echo "#endif"
             } > include/linux/static_call.h
-            echo "[i] 已创建 include/linux/static_call.h"
           fi
-          sed -n '1,6p' include/linux/static_call.h
+          sed -n "1,6p" include/linux/static_call.h
 
       - name: 8c. 生成附加配置脚本并挂到 build.sh
         id: s8c
         working-directory: kernel
         run: |
-          set -e
+          set -x
           {
-            echo '#!/bin/sh'
-            echo 'set -e'
-            echo 'if [ "$KSU_SUSFS_MODE" = "off" ]; then'
-            echo '  scripts/config --file out/.config -d KSU_SUSFS || true'
-            echo '  for s in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP KSU_SUSFS_PRIORITY_UID_FILTER; do'
-            echo '    scripts/config --file out/.config -d "$s" || true'
-            echo '  done'
-            echo 'fi'
-            echo 'if [ "$KSU_KPM_MODE" = "off" ]; then'
-            echo '  scripts/config --file out/.config -d KPM || true'
-            echo 'fi'
-            echo 'if [ "$KSU_KPROBES" = "on" ]; then'
-            echo '  scripts/config --file out/.config -e KPROBES -e KRETPROBES -e KPROBE_EVENTS || true'
-            echo 'fi'
-            echo 'echo "[i] extra config: SUSFS=$KSU_SUSFS_MODE KPM=$KSU_KPM_MODE KPROBES=$KSU_KPROBES"'
+            echo "#!/bin/sh"
+            echo "set -e"
+            echo "if [ \"$KSU_SUSFS_MODE\" = \"off\" ]; then"
+            echo "  scripts/config --file out/.config -d KSU_SUSFS || true"
+            echo "  for s in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP KSU_SUSFS_PRIORITY_UID_FILTER; do"
+            echo "    scripts/config --file out/.config -d \"$s\" || true"
+            echo "  done"
+            echo "fi"
+            echo "if [ \"$KSU_KPM_MODE\" = \"off\" ]; then"
+            echo "  scripts/config --file out/.config -d KPM || true"
+            echo "fi"
+            echo "if [ \"$KSU_KPROBES\" = \"on\" ]; then"
+            echo "  scripts/config --file out/.config -e KPROBES -e KRETPROBES -e KPROBE_EVENTS || true"
+            echo "fi"
+            echo "echo \"[i] extra config: SUSFS=$KSU_SUSFS_MODE KPM=$KSU_KPM_MODE KPROBES=$KSU_KPROBES\""
           } > ksu_extra_config.sh
           chmod +x ksu_extra_config.sh
-          sed -i 's|^make \$MAKE_ARGS -j\$(nproc)$|sh ksu_extra_config.sh\nmake $MAKE_ARGS -j$(nproc)|' build.sh
-          grep -n 'ksu_extra_config' build.sh
+          sed -i "s|^make \$MAKE_ARGS -j\$(nproc)$|sh ksu_extra_config.sh\nmake $MAKE_ARGS -j$(nproc)|" build.sh
+          if grep -q "ksu_extra_config" build.sh; then
+            echo "[ok] hooked into build.sh"
+            grep -n "ksu_extra_config" build.sh
+          else
+            echo "[x] not hooked, current make lines:"
+            grep -n "make" build.sh | tail -10 || true
+            exit 1
+          fi
           cat ksu_extra_config.sh
-      - name: 8d. Nova 源码 4.19 兼容补丁（access_ok / 预初始化宏 / 警告降级）
+
+      - name: 8d. Nova 源码 4.19 兼容补丁
         id: s8d
         working-directory: kernel
         run: |
           set -ex
-          sed -i '1i ccflags-y += -Wno-error' KernelSU/kernel/Makefile
-          sed -i 's|^#define KSU_NO_PREINIT$|#ifndef KSU_NO_PREINIT\n#define KSU_NO_PREINIT\n#endif|' KernelSU/kernel/preinit/common/preinit.h
-          sed -i 's|access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))|access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))|' KernelSU/kernel/extension/kpm/kpm.c
-          echo "===== Makefile 首行 ====="
+          sed -i "1i ccflags-y += -Wno-error" KernelSU/kernel/Makefile
+          sed -i "s|^#define KSU_NO_PREINIT$|#ifndef KSU_NO_PREINIT\n#define KSU_NO_PREINIT\n#endif|" KernelSU/kernel/preinit/common/preinit.h
+          sed -i "s|access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))|access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))|" KernelSU/kernel/extension/kpm/kpm.c
           head -3 KernelSU/kernel/Makefile
-          echo "===== preinit.h 4-10 行 ====="
-          sed -n '4,10p' KernelSU/kernel/preinit/common/preinit.h
-          echo "===== kpm.c access_ok ====="
-          grep -n "access_ok" KernelSU/kernel/extension/kpm/kpm.c
-          echo "===== 全仓库剩余的两参数 access_ok ====="
-          grep -rn "access_ok(" KernelSU/kernel | grep -v "VERIFY_" || echo "无"
+          sed -n "4,10p" KernelSU/kernel/preinit/common/preinit.h
+          grep -n "access_ok" KernelSU/kernel/extension/kpm/kpm.c || true
 
-      - name: 8e. execve hook 改回官方总入口（su 与 ksud 双处理）
+      - name: 8e. execve 走官方总入口
         id: s8e
         working-directory: kernel
         run: |
           set -ex
-          sed -i 's|if (unlikely(ksu_execveat_hook))|if (1)|' fs/exec.c
-          sed -i 's|if (!ksu_execveat_hook)|if (0)|' fs/exec.c
-          echo "===== exec.c 里的 hook 调用 ====="
-          grep -n "ksu_handle_execveat\|ksu_execveat_hook" fs/exec.c || echo "（没匹配到，可能已被替换）"
-          echo "===== 确认没有 NULL argv 的 sucompat 调用 ====="
-          grep -n "sucompat((int \*)AT_FDCWD, &filename, NULL" fs/exec.c && echo "[!] 仍有 NULL 调用" || echo "无"
+          sed -i "s|if (unlikely(ksu_execveat_hook))|if (1)|" fs/exec.c
+          sed -i "s|if (!ksu_execveat_hook)|if (0)|" fs/exec.c
+          grep -n "ksu_handle_execveat\|ksu_execveat_hook" fs/exec.c || echo "(no match)"
 
-      - name: 8g. A 路线补丁：execve 后置钩子（ksud 拿驱动 fd）
+      - name: 8g. A 路线：execve 后置钩子
         id: s8g
         if: env.HOOK_PATCH == 'postexec'
         working-directory: kernel
@@ -253,52 +254,35 @@ jobs:
           set -ex
           python3 - <<'PY'
           import re
-          p = 'fs/exec.c'
+          p = "fs/exec.c"
           s = open(p).read()
-          if 'ksu_handle_post_execveat_sucompat' in s:
-              print('already patched, skip')
+          if "ksu_handle_post_execveat_sucompat" in s:
+              print("already patched, skip")
           else:
-              anchor = 'extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,'
-              decl = 'extern int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr,\n\t\t\tvoid *argv, void *envp, int *flags, int *retval);\n'
+              anchor = "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,"
+              decl = "extern int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr,\n\t\t\tvoid *argv, void *envp, int *flags, int *retval);\n"
               if anchor not in s:
-                  print('anchor missing -> skip'); raise SystemExit(0)
-              s = s.replace(anchor, decl + anchor, 1)
-              newfn = '''int do_execve(struct filename *filename,
-          \tconst char __user *const __user *__argv,
-          \tconst char __user *const __user *__envp)
-          {
-          \tstruct user_arg_ptr argv = { .ptr.native = __argv };
-          \tstruct user_arg_ptr envp = { .ptr.native = __envp };
-          #ifdef CONFIG_KSU
-          \tint ksu_is_su;
-          \tint ksu_ret;
-
-          \tksu_is_su = (ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0) == 0);
-          \tksu_ret = do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
-          \tif (ksu_is_su && ksu_ret >= 0)
-          \t\tksu_handle_post_execveat_sucompat(0, 0, 0, 0, 0, &ksu_ret);
-          \treturn ksu_ret;
-          #else
-          \treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
-          #endif
-          }
-          '''
-              m = re.search(r'int do_execve\(struct filename \*filename,.*?\n\}\n', s, re.S)
-              if not m:
-                  print('do_execve not found -> skip'); raise SystemExit(0)
-              s = s[:m.start()] + newfn + s[m.end():]
-              open(p, 'w').write(s)
-              print('patched ok')
+                  print("anchor missing -> skip")
+              else:
+                  s = s.replace(anchor, decl + anchor, 1)
+                  newfn = "int do_execve(struct filename *filename,\n\tconst char __user *const __user *__argv,\n\tconst char __user *const __user *__envp)\n{\n\tstruct user_arg_ptr argv = { .ptr.native = __argv };\n\tstruct user_arg_ptr envp = { .ptr.native = __envp };\n#ifdef CONFIG_KSU\n\tint ksu_is_su;\n\tint ksu_ret;\n\n\tksu_is_su = (ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0) == 0);\n\tksu_ret = do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n\tif (ksu_is_su && ksu_ret >= 0)\n\t\tksu_handle_post_execveat_sucompat(0, 0, 0, 0, 0, &ksu_ret);\n\treturn ksu_ret;\n#else\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n#endif\n}\n"
+                  m = re.search(r"int do_execve\(struct filename \*filename,.*?\n\}\n", s, re.S)
+                  if not m:
+                      print("do_execve not found -> skip")
+                  else:
+                      s = s[:m.start()] + newfn + s[m.end():]
+                      open(p, "w").write(s)
+                      print("patched ok")
           PY
-          echo '===== do_execve 现状 ====='
-          sed -n '/^int do_execve(struct filename/,/^}/p' fs/exec.c
-      - name: 8f. ccache 缓存（命中后编译提速一半以上）
+          sed -n "/^int do_execve(struct filename/,/^}/p" fs/exec.c || true
+
+      - name: 8f. ccache 缓存
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache_mikernel
-          key: ccache-v2-${{ github.event.inputs.ksu_ref }}-${{ github.event.inputs.variant }}-${{ github.event.inputs.kprobe_mode }}-${{ github.event.inputs.susfs_mode }}
+          key: ccache-v2-${{ github.event.inputs.ksu_ref }}-${{ github.event.inputs.variant }}-${{ github.event.inputs.hook_patch }}-${{ github.event.inputs.kprobe_mode }}-${{ github.event.inputs.susfs_mode }}
 
-      - name: 9a. 全量编译（按输入配置，KPM 可能 on）
+      - name: 9a. 编译（按输入配置）
         id: build_a
         continue-on-error: true
         working-directory: kernel
@@ -308,7 +292,7 @@ jobs:
           ccache -M 4G || true
           bash build.sh umi ksu 2>&1 | tee ../build_a.log
 
-      - name: 9b. 若 9a 失败：自动关掉 KPM 再跑一遍
+      - name: 9b. 若 9a 失败则关掉 KPM 重试
         if: steps.build_a.outcome == 'failure'
         working-directory: kernel
         env:
@@ -316,7 +300,7 @@ jobs:
         run: |
           set -o pipefail
           export CCACHE_DIR="$HOME/.cache/ccache_mikernel"
-          echo "[i] 第一次编译失败，自动切到 KPM=off 重试"
+          echo "[i] retry with KPM=off"
           bash build.sh umi ksu 2>&1 | tee ../build.log
 
       - name: 10. 产物自检
@@ -328,13 +312,14 @@ jobs:
             echo "===== $f ====="
             grep -m2 "SukiSU-Nova version:" "$f" || true
             grep -E "AOSP Build successfully|MIUI Build successfully" "$f" || true
+            grep -m2 "extra config" "$f" || true
           done
           for z in Kernel_*.zip; do
             unzip -p "$z" kernels/Image > /tmp/img.bin
             echo "--- $z"
             echo "  size : $(stat -c%s /tmp/img.bin)"
-            echo "  ver  : $(strings /tmp/img.bin | grep -m1 'Linux version')"
-            echo "  ksu  : $(strings /tmp/img.bin | grep -m1 'SukiSU-Nova' || true)"
+            echo "  ver  : $(strings /tmp/img.bin | grep -m1 "Linux version")"
+            echo "  ksu  : $(strings /tmp/img.bin | grep -m1 "SukiSU-Nova" || true)"
           done
 
       - name: 11. 收集产物
@@ -343,41 +328,44 @@ jobs:
         run: |
           mkdir -p ../artifacts/modules
           cp Kernel_*.zip ../artifacts/ 2>/dev/null || true
-          find out -name '*.ko' -print0 2>/dev/null | xargs -0 -r cp --parents -t ../artifacts/modules/ 2>/dev/null || true
+          find out -name "*.ko" -print0 2>/dev/null | xargs -0 -r cp --parents -t ../artifacts/modules/ 2>/dev/null || true
           cp ../build.log ../build_a.log ../artifacts/ 2>/dev/null || true
 
-      - name: 12. 失败时捞错误（先列工作区，再按存在的日志抓）
+      - name: 12. 失败时捞错误
         if: failure()
         run: |
-          echo '===== 工作区 ====='
+          echo "===== 工作区 ====="
           pwd
           ls -la | head -40 || true
           for f in build_a.log build.log; do
             if [ -f "$f" ]; then
-              echo "===== $f 错误行 ====="
-              grep -nE 'error:|Error [0-9]+|undefined reference|implicit declaration|fatal error' "$f" | tail -25 || echo '无典型错误行'
-              echo "===== $f 尾部 ====="
+              echo "===== $f errors ====="
+              grep -nE "error:|Error [0-9]+|undefined reference|implicit declaration|fatal error" "$f" | tail -25 || echo "no typical errors"
+              echo "===== $f tail ====="
               tail -20 "$f"
             else
-              echo "[!] $f 不存在 —— 说明编译步骤根本没启动，问题在更前面的步骤"
+              echo "[!] $f missing -> build never started"
             fi
           done
-      - name: 12b. 各步结果汇总（一眼看出谁红了）
+
+      - name: 12b. 各步结果汇总
         if: always()
         run: |
-          echo '================ 步骤结果 ================'
-          echo "6  关 setup      : ${{ steps.s6.outcome }}"
-          echo "6b 裁剪变体     : ${{ steps.s6b.outcome }}"
-          echo "7  预装 KSU     : ${{ steps.s7.outcome }}"
-          echo "8  停用 hook    : ${{ steps.s8.outcome }}"
-          echo "8b static_call  : ${{ steps.s8b.outcome }}"
-          echo "8c 附加配置     : ${{ steps.s8c.outcome }}"
-          echo "8d 源码兼容     : ${{ steps.s8d.outcome }}"
-          echo "8e execve 总入口: ${{ steps.s8e.outcome }}"
-          echo "8g A 路线补丁   : ${{ steps.s8g.outcome }}"
-          echo "9a 编译         : ${{ steps.build_a.outcome }}"
-          echo '========================================='
+          echo "================ STEP RESULT ================"
+          echo "1  checkout    : ${{ steps.tc.outcome }}"
+          echo "6  setup off   : ${{ steps.s6.outcome }}"
+          echo "6b trim        : ${{ steps.s6b.outcome }}"
+          echo "7  ksu setup   : ${{ steps.s7.outcome }}"
+          echo "8  hook off    : ${{ steps.s8.outcome }}"
+          echo "8b static_call : ${{ steps.s8b.outcome }}"
+          echo "8c extra cfg   : ${{ steps.s8c.outcome }}"
+          echo "8d src compat  : ${{ steps.s8d.outcome }}"
+          echo "8e exec entry  : ${{ steps.s8e.outcome }}"
+          echo "8g postexec    : ${{ steps.s8g.outcome }}"
+          echo "9a build       : ${{ steps.build_a.outcome }}"
+          echo "============================================="
           exit 0
+
       - name: 13. 上传
         if: always()
         uses: actions/upload-artifact@v4
