@@ -131,28 +131,29 @@ jobs:
           CNT=$(git rev-list --count main 2>/dev/null || echo 0)
           echo "预测 KSU_VERSION = $((30000 + CNT - 4001))"
 
-      - name: 8. 自动适配 hook（改名 / 停用缺失符号）
-        if: env.HOOK_MODE != 'manual'
+      - name: 8. 停用 Nova 里没有对应实现的两个 hook（确定性写法）
         working-directory: kernel
         run: |
-          set -e
-          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c; do
-            missing=""
-            for sym in $(grep -hoE 'ksu_[a-z0-9_]+' "$f" | sort -u); do
-              if ! grep -rq -F "$sym" KernelSU/kernel; then
-                missing="$missing $sym"
-              fi
-            done
-            if [ -n "$missing" ] || [ "$HOOK_MODE" = "off" ]; then
-              echo "$f: 停用 hook 块 (${missing})"
+          set -x
+          pwd
+          ls -d KernelSU/kernel
+          # Nova builtin 里没有 ksu_handle_sys_read / ksu_input_hook，这两个块必须停用
+          for f in fs/read_write.c drivers/input/input.c; do
+            sed -i 's|^[[:space:]]*#ifdef CONFIG_KSU[[:space:]]*$|#if 0|' "$f"
+            sed -i 's|^[[:space:]]*#if defined(CONFIG_KSU)[[:space:]]*$|#if 0|' "$f"
+            echo "$f -> $(grep -c '^#if 0' "$f") 处已停用"
+          done
+          # hook_mode=off 时把剩下的三个也停掉（配合 main 树/kprobe 用）
+          if [ "$HOOK_MODE" = "off" ]; then
+            for f in fs/exec.c fs/open.c fs/stat.c; do
               sed -i 's|^[[:space:]]*#ifdef CONFIG_KSU[[:space:]]*$|#if 0|' "$f"
               sed -i 's|^[[:space:]]*#if defined(CONFIG_KSU)[[:space:]]*$|#if 0|' "$f"
-            else
-              echo "$f: 保留（符号齐全）"
-            fi
-          done
-          grep -n '^#if 0' fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c || echo "无停用"
-
+              echo "$f -> $(grep -c '^#if 0' "$f") 处已停用"
+            done
+          else
+            echo 'hook_mode!=off：exec/open/stat 保留手动 hook'
+          fi
+          grep -n '^#if 0' fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c || true
       - name: 8b. 造 4.19 缺失头文件（static_call.h）
         working-directory: kernel
         run: |
