@@ -274,7 +274,7 @@ jobs:
                   print("anchor missing -> skip")
               else:
                   s = s.replace(anchor, decl + anchor, 1)
-                  newfn = "int do_execve(struct filename *filename,\n\tconst char __user *const __user *__argv,\n\tconst char __user *const __user *__envp)\n{\n\tstruct user_arg_ptr argv = { .ptr.native = __argv };\n\tstruct user_arg_ptr envp = { .ptr.native = __envp };\n#ifdef CONFIG_KSU\n\tint ksu_is_su;\n\tint ksu_ret;\n\n\tksu_is_su = (ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0) == 0);\n\tksu_ret = do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n\tif (ksu_is_su && ksu_ret >= 0)\n\t\tksu_install_su_fd();\n\treturn ksu_ret;\n#else\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n#endif\n}\n"
+                  newfn = "int do_execve(struct filename *filename,\n\tconst char __user *const __user *__argv,\n\tconst char __user *const __user *__envp)\n{\n\tstruct user_arg_ptr argv = { .ptr.native = __argv };\n\tstruct user_arg_ptr envp = { .ptr.native = __envp };\n#ifdef CONFIG_KSU\n\tint ksu_is_su;\n\tint ksu_ret;\n\n\tksu_is_su = (ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0) == 0);\n\tksu_ret = do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n\tif (ksu_is_su && ksu_ret >= 0 && current->pid != 1 && !(current->flags & PF_KTHREAD))\n\t\tksu_install_su_fd();\n\treturn ksu_ret;\n#else\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n#endif\n}\n"
                   m = re.search(r"int do_execve\(struct filename \*filename,.*?\n\}\n", s, re.S)
                   if not m:
                       print("do_execve not found -> skip")
