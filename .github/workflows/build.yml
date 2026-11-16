@@ -90,17 +90,23 @@ jobs:
           path: ~/proton-clang
           key: proton-clang-20210522-v1
 
-      - name: 5. 下载 proton-clang
+      - name: 5. 下载 proton-clang（三源重试，抗网络抖动）
         if: steps.tc.outputs.cache-hit != 'true'
         run: |
+          set -x
           mkdir -p "$HOME/proton-clang" && cd "$HOME/proton-clang"
-          for i in 1 2 3 4 5 6; do
-            wget -q --tries=3 --retry-connrefused --waitretry=8 https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip && break
-            echo "[retry $i]"; sleep 15
+          ok=0
+          for url in \
+            https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip \
+            https://gh-proxy.com/https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip \
+            https://codeload.github.com/kdrag0n/proton-clang/zip/refs/tags/20210522 ; do
+            echo "[i] 尝试: $url"
+            if wget -q --tries=2 --timeout=40 -O pc.zip "$url" && unzip -q -o pc.zip; then ok=1; break; fi
+            echo '[retry] 换下一个源'
           done
-          unzip -q 20210522.zip
-          test -x proton-clang-20210522/bin/clang
-
+          test "$ok" = "1" || { echo '[x] 三个源都失败'; exit 1; }
+          test -x proton-clang-20210522/bin/clang || { echo '[x] 解压后找不到 clang'; exit 1; }
+          echo '[ok] 工具链就绪'
       - name: 6. 关掉 build.sh 自带的 KSU setup（避免它 git stash 掉我们的补丁）
         id: s6
         working-directory: kernel
@@ -123,17 +129,27 @@ jobs:
           echo "===== AOSP 段是否已删除 ====="
           grep -c "Building for AOSP" build.sh || echo "0（已删除）"
 
-      - name: 7. 预装 Nova KSU（builtin）
+      - name: 7. 预装 Nova KSU（带重试）
         id: s7
         working-directory: kernel
         run: |
-          set -e
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" | bash -s "${KSU_REF}"
+          set -x
+          ok=0
+          for i in 1 2 3; do
+            if curl -LSsf --retry 3 --connect-timeout 20 --max-time 120 \
+                 https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh -o /tmp/ksu_setup.sh \
+               && [ -s /tmp/ksu_setup.sh ]; then
+              sh /tmp/ksu_setup.sh "$KSU_REF" && ok=1 && break
+            fi
+            echo "[retry $i] KSU setup 失败"
+            sleep 10
+          done
+          test "$ok" = "1" || { echo '[x] KSU setup 三次都失败'; exit 1; }
+          test -d KernelSU/kernel || { echo '[x] KernelSU/kernel 不存在'; exit 1; }
           cd KernelSU
           git log -1 --format='KSU 提交: %h %ad %s' --date=short
-          CNT=$(git rev-list --count main 2>/dev/null || echo 0)
+          CNT=$(git rev-list --count HEAD 2>/dev/null || echo 0)
           echo "预测 KSU_VERSION = $((30000 + CNT - 4001))"
-
       - name: 8. 停用 Nova 里没有对应实现的两个 hook（确定性写法）
         id: s8
         working-directory: kernel
