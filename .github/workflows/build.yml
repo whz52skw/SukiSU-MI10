@@ -234,18 +234,34 @@ jobs:
           grep -n "ksu_extra_config" build.sh || { echo "[x] build.sh 没被挂钩，配置不会生效"; exit 1; }
           echo '===== ksu_extra_config.sh ====='
           cat ksu_extra_config.sh
-      - name: 8d. Nova 源码 4.19 兼容补丁
+      - name: 8d. 4.19 源码兼容补丁（按树型自动跳过缺失文件）
         id: s8d
         working-directory: kernel
         run: |
           set -ex
-          sed -i "1i ccflags-y += -Wno-error" KernelSU/kernel/Makefile
-          sed -i "s|^#define KSU_NO_PREINIT$|#ifndef KSU_NO_PREINIT\n#define KSU_NO_PREINIT\n#endif|" KernelSU/kernel/preinit/common/preinit.h
-          sed -i "s|access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))|access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))|" KernelSU/kernel/extension/kpm/kpm.c
-          head -3 KernelSU/kernel/Makefile
-          sed -n "4,10p" KernelSU/kernel/preinit/common/preinit.h
-          grep -n "access_ok" KernelSU/kernel/extension/kpm/kpm.c || true
-
+          # 1) 让 KSU 编译容忍警告：Makefile（builtin/LKM）与 Kbuild（main in-tree）都照顾到
+          if [ -f KernelSU/kernel/Makefile ]; then
+            grep -q 'Wno-error' KernelSU/kernel/Makefile || sed -i '1i ccflags-y += -Wno-error' KernelSU/kernel/Makefile
+          fi
+          if [ -f KernelSU/kernel/Kbuild ]; then
+            grep -q 'Wno-error' KernelSU/kernel/Kbuild || sed -i '1i ccflags-y += -Wno-error' KernelSU/kernel/Kbuild
+          fi
+          # 2) builtin 树：KSU_NO_PREINIT 宏重复定义
+          if [ -f KernelSU/kernel/preinit/common/preinit.h ]; then
+            sed -i 's|^#define KSU_NO_PREINIT$|#ifndef KSU_NO_PREINIT\n#define KSU_NO_PREINIT\n#endif|' KernelSU/kernel/preinit/common/preinit.h
+            sed -n '4,10p' KernelSU/kernel/preinit/common/preinit.h
+          else
+            echo '[skip] preinit.h 不存在（main 树布局）'
+          fi
+          # 3) builtin 树：4.19 的 access_ok 是三参数
+          if [ -f KernelSU/kernel/extension/kpm/kpm.c ]; then
+            sed -i 's|access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))|access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))|' KernelSU/kernel/extension/kpm/kpm.c
+            grep -n 'access_ok' KernelSU/kernel/extension/kpm/kpm.c || true
+          else
+            echo '[skip] kpm.c 不存在（main 树布局）'
+          fi
+          echo '===== 当前 KSU 树文件清单（前 30）====='
+          ls KernelSU/kernel | head -30
       - name: 8e. execve 走官方总入口
         id: s8e
         working-directory: kernel
