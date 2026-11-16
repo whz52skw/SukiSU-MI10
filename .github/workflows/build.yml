@@ -283,7 +283,7 @@ jobs:
           sed -i "s|if (!ksu_execveat_hook)|if (0)|" fs/exec.c
           grep -n "ksu_handle_execveat\|ksu_execveat_hook" fs/exec.c || echo "(no match)"
 
-      - name: 8g. A 路线：execve 后置装 fd（SUSFS 关闭时用 ksu_install_su_fd）
+      - name: 8g. A 路线：hook 移到 do_execveat_common（覆盖 execve/execveat/posix_spawn）
         id: s8g
         if: env.HOOK_PATCH == 'postexec'
         working-directory: kernel
@@ -293,26 +293,28 @@ jobs:
           import re
           p = "fs/exec.c"
           s = open(p).read()
-          if "ksu_install_su_fd" in s:
+          if "ksu_is_su" in s:
               print("already patched, skip")
           else:
-              anchor = "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,"
-              decl = "extern int ksu_install_su_fd(void);\n"
-              if anchor not in s:
-                  print("anchor missing -> skip")
+              plain = "int do_execve(struct filename *filename,\n\tconst char __user *const __user *__argv,\n\tconst char __user *const __user *__envp)\n{\n\tstruct user_arg_ptr argv = { .ptr.native = __argv };\n\tstruct user_arg_ptr envp = { .ptr.native = __envp };\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n}\n"
+              m = re.search(r"int do_execve\(struct filename \*filename,.*?\n\}\n", s, re.S)
+              if not m:
+                  print("do_execve not found -> skip")
               else:
-                  s = s.replace(anchor, decl + anchor, 1)
-                  newfn = "int do_execve(struct filename *filename,\n\tconst char __user *const __user *__argv,\n\tconst char __user *const __user *__envp)\n{\n\tstruct user_arg_ptr argv = { .ptr.native = __argv };\n\tstruct user_arg_ptr envp = { .ptr.native = __envp };\n#ifdef CONFIG_KSU\n\tint ksu_is_su;\n\tint ksu_ret;\n\tint ksu_uid;\n\n\tksu_uid = current_uid().val;\n\tksu_is_su = (ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0) == 0);\n\tksu_ret = do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n\tif (ksu_is_su && ksu_ret >= 0 && ksu_uid >= 10000)\n\t\tksu_install_su_fd();\n\treturn ksu_ret;\n#else\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n#endif\n}\n"
-                  m = re.search(r"int do_execve\(struct filename \*filename,.*?\n\}\n", s, re.S)
-                  if not m:
-                      print("do_execve not found -> skip")
+                  s = s[:m.start()] + plain + s[m.end():]
+                  hooked = "static int do_execveat_common(int fd, struct filename *filename,\n\t\t\t      struct user_arg_ptr argv,\n\t\t\t      struct user_arg_ptr envp,\n\t\t\t      int flags)\n{\n#ifdef CONFIG_KSU\n\textern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n\t\t\tvoid *envp, int *flags);\n\textern int ksu_install_su_fd(void);\n\tint ksu_is_su;\n\tint ksu_ret;\n\tint ksu_uid;\n\n\tksu_uid = current_uid().val;\n\tksu_is_su = (ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags) == 0);\n\tksu_ret = __do_execve_file(fd, filename, argv, envp, flags, NULL);\n\tif (ksu_is_su && ksu_ret >= 0 && ksu_uid >= 10000)\n\t\tksu_install_su_fd();\n\treturn ksu_ret;\n#else\n\treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);\n#endif\n}\n"
+                  m2 = re.search(r"static int do_execveat_common\(int fd, struct filename \*filename,.*?\n\}\n", s, re.S)
+                  if not m2:
+                      print("do_execveat_common not found -> skip")
                   else:
-                      s = s[:m.start()] + newfn + s[m.end():]
+                      s = s[:m2.start()] + hooked + s[m2.end():]
                       open(p, "w").write(s)
                       print("patched ok")
           PY
+          echo '===== do_execve ====='
           sed -n '/^int do_execve(struct filename/,/^}/p' fs/exec.c || true
-          grep -n 'ksu_install_su_fd' fs/exec.c || true
+          echo '===== do_execveat_common ====='
+          sed -n '/^static int do_execveat_common(int fd, struct filename/,/^}/p' fs/exec.c || true
       - name: 8f. ccache 缓存
         uses: actions/cache@v4
         with:
