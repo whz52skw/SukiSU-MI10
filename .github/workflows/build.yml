@@ -262,6 +262,18 @@ jobs:
           fi
           echo '===== 当前 KSU 树文件清单（前 30）====='
           ls KernelSU/kernel | head -30
+      - name: 8h. main 树的 4.19 兼容补丁（MODULE_IMPORT_NS 不存在）
+        id: s8h
+        working-directory: kernel
+        run: |
+          set -ex
+          if [ -f KernelSU/kernel/core/init.c ]; then
+            grep -c 'MODULE_IMPORT_NS(' KernelSU/kernel/core/init.c || true
+            sed -i 's|^MODULE_IMPORT_NS(.*);$|/* 4.19: MODULE_IMPORT_NS 不存在，置空 */|' KernelSU/kernel/core/init.c
+            grep -n 'MODULE_IMPORT_NS' KernelSU/kernel/core/init.c || echo '[ok] 已清空'
+          else
+            echo '[skip] core/init.c 不存在（builtin 树）'
+          fi
       - name: 8e. execve 走官方总入口
         id: s8e
         working-directory: kernel
@@ -387,6 +399,7 @@ jobs:
           echo "8d src compat  : ${{ steps.s8d.outcome }}"
           echo "8e exec entry  : ${{ steps.s8e.outcome }}"
           echo "8g postexec    : ${{ steps.s8g.outcome }}"
+          echo "8h main compat : ${{ steps.s8h.outcome }}"
           echo "9a build       : ${{ steps.build_a.outcome }}"
           echo "============================================="
           exit 0
