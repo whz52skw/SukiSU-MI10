@@ -364,6 +364,29 @@ jobs:
 
           PY
           grep -n 'compat feature 10003' KernelSU/kernel/policy/feature.c || true
+      - name: 8k. ioctl 全量日志（看清管理器哪条命令被拒）
+        id: s8k
+        if: env.HOOK_PATCH == 'postexec'
+        working-directory: kernel
+        run: |
+          set -ex
+          python3 - <<'PY'
+          p = "KernelSU/kernel/supercall/dispatch.c"
+          s = open(p).read()
+          if "ksu ioctl: cmd=" in s and "ret=%d" in s:
+              print("ioctl log already patched")
+          else:
+              old = "            // Execute handler\n            return ksu_ioctl_handlers[i].handler(argp);"
+              new = "            // Execute handler\n            {\n                int __ksu_r = ksu_ioctl_handlers[i].handler(argp);\n                pr_info(\"ksu ioctl: cmd=0x%x uid=%d ret=%d\\n\", cmd, current_uid().val, __ksu_r);\n                return __ksu_r;\n            }"
+              if old not in s:
+                  print("dispatch anchor missing -> skip")
+              else:
+                  s = s.replace(old, new, 1)
+                  open(p, "w").write(s)
+                  print("ioctl log patched")
+
+          PY
+          grep -n 'ksu ioctl: cmd=' KernelSU/kernel/supercall/dispatch.c || true
       - name: 8f. ccache 缓存
         uses: actions/cache@v4
         with:
@@ -453,6 +476,7 @@ jobs:
           echo "8h main compat : ${{ steps.s8h.outcome }}"
           echo "8i allow bypass : ${{ steps.s8i.outcome }}"
           echo "8j feature stub : ${{ steps.s8j.outcome }}"
+          echo "8k ioctl log    : ${{ steps.s8k.outcome }}"
           echo "9a build       : ${{ steps.build_a.outcome }}"
           echo "============================================="
           exit 0
