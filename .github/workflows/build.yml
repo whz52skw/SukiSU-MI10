@@ -315,27 +315,54 @@ jobs:
           sed -n '/^int do_execve(struct filename/,/^}/p' fs/exec.c || true
           echo '===== do_execveat_common ====='
           sed -n '/^static int do_execveat_common(int fd, struct filename/,/^}/p' fs/exec.c || true
-      - name: 8i. 诊断补丁（把管理器状态写到 /data/local/tmp/ksu_diag.txt）
+      - name: 8i. 开发版白名单（硬放行 shell 2000 与 MT 10302）
         id: s8i
         if: env.HOOK_PATCH == 'postexec'
         working-directory: kernel
         run: |
           set -ex
           python3 - <<'PY'
-          p = "KernelSU/kernel/runtime/ksud.c"
+          p = "KernelSU/kernel/policy/allowlist.c"
           s = open(p).read()
-          if "ksu_diag_dump" in s:
-              print("diag already patched")
+          old = "    if (unlikely(uid == SHELL_UID) && !ksu_shell_su_allowed_for_current()) {\n        return false;\n    }"
+          new = "    if (uid == SHELL_UID || uid == 10302) { /* dev build: hard-allow shell + MT */\n        return true;\n    }"
+          if "dev build: hard-allow" in s:
+              print("allowlist bypass already patched")
+          elif old not in s:
+              print("anchor missing -> skip")
           else:
-              fn = "static void ksu_diag_dump(const char *tag)\n{\n    struct file *f;\n    char buf[192];\n    int n;\n\n    n = snprintf(buf, sizeof(buf),\n                 \"[%s] mgr_valid=%d mgr_appid=%d sucompat=%d allow_shell=%d\\n\",\n                 tag, ksu_is_manager_appid_valid(), ksu_get_manager_appid(),\n                 ksu_su_compat_enabled, allow_shell);\n    f = filp_open(\"/data/local/tmp/ksu_diag.txt\", O_WRONLY | O_CREAT | O_APPEND, 0644);\n    if (IS_ERR(f)) {\n        pr_err(\"ksu_diag: open failed %ld\\n\", PTR_ERR(f));\n        return;\n    }\n    kernel_write(f, buf, n, &f->f_pos);\n    filp_close(f, NULL);\n}\n\n"
-              s = s.replace("void on_post_fs_data(void)", fn + "void on_post_fs_data(void)", 1)
-              s = s.replace("    ksu_observer_init();", "    ksu_observer_init();\n    ksu_diag_dump(\"post_fs_data\");", 1)
-              s = s.replace("    track_throne(true);", "    track_throne(true);\n    ksu_diag_dump(\"boot_completed\");", 1)
+              s = s.replace(old, new, 1)
               open(p, "w").write(s)
-              print("diag patched")
+              print("allowlist bypass patched")
 
           PY
-          grep -n 'ksu_diag_dump' KernelSU/kernel/runtime/ksud.c || true
+          grep -n 'hard-allow' KernelSU/kernel/policy/allowlist.c || true
+      - name: 8j. 特性桩：让管理器以为内核支持 feature 10003
+        id: s8j
+        if: env.HOOK_PATCH == 'postexec'
+        working-directory: kernel
+        run: |
+          set -ex
+          python3 - <<'PY'
+          p = "KernelSU/kernel/ksu_main.c"
+          s = open(p).read()
+          if "compat_10003" in s:
+              print("feature stub already patched")
+          else:
+              stub = "#ifdef CONFIG_KSU\nstatic int ksu_compat_feature_get(u64 *value) { *value = 1; return 0; }\nstatic int ksu_compat_feature_set(u64 value) { return 0; }\nstatic const struct ksu_feature_handler ksu_compat_feature_10003 = {\n    .feature_id = 10003,\n    .name = \"compat_10003\",\n    .get_handler = ksu_compat_feature_get,\n    .set_handler = ksu_compat_feature_set,\n};\n#endif\n\n"
+              anchor = "int __init kernelsu_init(void)"
+              if anchor not in s:
+                  print("kernelsu_init anchor missing")
+              else:
+                  s = s.replace(anchor, stub + anchor, 1)
+                  old = "    ksu_feature_init();"
+                  new = "    ksu_feature_init();\n    ksu_register_feature_handler(&ksu_compat_feature_10003);"
+                  s = s.replace(old, new, 1)
+                  open(p, "w").write(s)
+                  print("feature stub patched")
+
+          PY
+          grep -n 'compat_10003' KernelSU/kernel/ksu_main.c || true
       - name: 8f. ccache 缓存
         uses: actions/cache@v4
         with:
@@ -423,7 +450,8 @@ jobs:
           echo "8e exec entry  : ${{ steps.s8e.outcome }}"
           echo "8g postexec    : ${{ steps.s8g.outcome }}"
           echo "8h main compat : ${{ steps.s8h.outcome }}"
-          echo "8i diag patch  : ${{ steps.s8i.outcome }}"
+          echo "8i allow bypass : ${{ steps.s8i.outcome }}"
+          echo "8j feature stub : ${{ steps.s8j.outcome }}"
           echo "9a build       : ${{ steps.build_a.outcome }}"
           echo "============================================="
           exit 0
