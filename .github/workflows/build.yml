@@ -197,42 +197,43 @@ jobs:
         id: s8c
         working-directory: kernel
         run: |
-          set -x
-          {
-            echo "#!/bin/sh"
-            echo "set -e"
-            echo "ls -l out/.config 2>/dev/null || echo \"[warn] out/.config missing before extra config\""
-            echo "if [ ! -f out/.config ]; then"
-            echo "  echo \"[i] run defconfig to create out/.config\""
-            echo "  make ARCH=arm64 SUBARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- umi_defconfig || exit 1"
-            echo "fi"
-            echo "if [ \"$KSU_SUSFS_MODE\" = \"off\" ]; then"
-            echo "  scripts/config --file out/.config -d KSU_SUSFS || true"
-            echo "  for s in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP KSU_SUSFS_PRIORITY_UID_FILTER; do"
-            echo "    scripts/config --file out/.config -d \"$s\" || true"
-            echo "  done"
-            echo "fi"
-            echo "if [ \"$KSU_KPM_MODE\" = \"off\" ]; then"
-            echo "  scripts/config --file out/.config -d KPM || true"
-            echo "fi"
-            echo "if [ \"$KSU_KPROBES\" = \"on\" ]; then"
-            echo "  scripts/config --file out/.config -e KPROBES -e KRETPROBES -e KPROBE_EVENTS || true"
-            echo "fi"
-            echo "echo \"[i] extra config: SUSFS=$KSU_SUSFS_MODE KPM=$KSU_KPM_MODE KPROBES=$KSU_KPROBES\""
-          } > ksu_extra_config.sh
-          chmod +x ksu_extra_config.sh
-          sh -n ksu_extra_config.sh && echo "[ok] script syntax ok"
-          sed -i "s|^make \$MAKE_ARGS -j\$(nproc)$|sh ksu_extra_config.sh\nmake $MAKE_ARGS -j$(nproc)|" build.sh
-          if grep -q "ksu_extra_config" build.sh; then
-            echo "[ok] hooked into build.sh"
-            grep -n "ksu_extra_config" build.sh
-          else
-            echo "[x] not hooked, current make lines:"
-            grep -n "make" build.sh | tail -10 || true
-            exit 1
-          fi
-          cat ksu_extra_config.sh
+          set -ex
+          python3 - <<'PY'
+          import os
 
+          script = r"""#!/bin/sh
+          set -e
+          [ -f out/.config ] || { echo "[x] out/.config missing before extra config"; exit 1; }
+          if [ "$KSU_SUSFS_MODE" = "off" ]; then
+            scripts/config --file out/.config -d KSU_SUSFS || true
+            for s in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP KSU_SUSFS_PRIORITY_UID_FILTER; do
+              scripts/config --file out/.config -d "$s" || true
+            done
+          fi
+          if [ "$KSU_KPM_MODE" = "off" ]; then
+            scripts/config --file out/.config -d KPM || true
+          fi
+          if [ "$KSU_KPROBES" = "on" ]; then
+            scripts/config --file out/.config -e KPROBES -e KRETPROBES -e KPROBE_EVENTS || true
+          fi
+          echo "[i] extra config: SUSFS=$KSU_SUSFS_MODE KPM=$KSU_KPM_MODE KPROBES=$KSU_KPROBES"
+          """
+          open("ksu_extra_config.sh", "w").write(script)
+
+          old = "make $MAKE_ARGS -j$(nproc)"
+          new = "sh ksu_extra_config.sh\nmake $MAKE_ARGS -j$(nproc)"
+          s = open("build.sh").read()
+          if old not in s:
+              print("[x] anchor not found in build.sh")
+              raise SystemExit(1)
+          s = s.replace(old, new)
+          open("build.sh", "w").write(s)
+          print("[ok] hooked, occurrences:", s.count("ksu_extra_config"))
+          PY
+          sh -n ksu_extra_config.sh && echo '[ok] script syntax ok'
+          grep -n 'ksu_extra_config' build.sh
+          echo '===== ksu_extra_config.sh ====='
+          cat ksu_extra_config.sh
       - name: 8d. Nova 源码 4.19 兼容补丁
         id: s8d
         working-directory: kernel
