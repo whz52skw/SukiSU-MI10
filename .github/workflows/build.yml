@@ -387,6 +387,122 @@ jobs:
 
           PY
           grep -n 'ksu ioctl: cmd=' KernelSU/kernel/supercall/dispatch.c || true
+      - name: 8l. allowlist 热加载（读列表/读profile 前重读文件）
+        id: s8l
+        if: env.HOOK_PATCH == 'postexec'
+        working-directory: kernel
+        run: |
+          set -ex
+          python3 - <<'PY'
+          p = "KernelSU/kernel/supercall/dispatch.c"
+          s = open(p).read()
+          if "ksu_allowlist_reload" in s:
+              print("reload already patched")
+          else:
+              helper = "static unsigned long ksu_last_reload_jiffies;\nstatic void ksu_allowlist_reload(void)\n{\n    unsigned long now = jiffies;\n\n    if (ksu_last_reload_jiffies && time_before(now, ksu_last_reload_jiffies + HZ))\n        return;\n    ksu_last_reload_jiffies = now;\n    ksu_load_allow_list();\n}\n\n"
+              anchor1 = "long ksu_supercall_handle_ioctl(const struct file *filp, unsigned int cmd, void __user *argp)"
+              if anchor1 not in s:
+                  print("handle_ioctl anchor missing")
+              else:
+                  s = s.replace(anchor1, helper + anchor1, 1)
+                  old = "            // Execute handler\n            {"
+                  new = "            // Execute handler\n            if ((cmd & 0xffff) == 0x4b06 || (cmd & 0xffff) == 0x4b0b)\n                ksu_allowlist_reload();\n            {"
+                  s = s.replace(old, new, 1)
+                  open(p, "w").write(s)
+                  print("reload patched")
+
+          PY
+          grep -n 'ksu_allowlist_reload' KernelSU/kernel/supercall/dispatch.c || true
+      - name: 8m. 文本 UID 白名单（/data/adb/ksu_uids.txt）
+        id: s8m
+        if: env.HOOK_PATCH == 'postexec'
+        working-directory: kernel
+        run: |
+          set -ex
+          python3 - <<'PY'
+          p = "KernelSU/kernel/policy/allowlist.c"
+          s = open(p).read()
+          if "ksu_load_uid_text_file" in s:
+              print("text-uid already patched")
+          else:
+              fn = r'''void ksu_load_uid_text_file(void)
+          {
+              struct file *fp;
+              char buf[1024];
+              loff_t off = 0;
+              ssize_t n;
+              int i;
+              uid_t uid = 0;
+              bool have = false;
+
+              fp = filp_open("/data/adb/ksu_uids.txt", O_RDONLY, 0);
+              if (IS_ERR(fp))
+                  return;
+              n = kernel_read(fp, buf, sizeof(buf) - 1, &off);
+              filp_close(fp, NULL);
+              if (n <= 0)
+                  return;
+              buf[n] = 0;
+              for (i = 0; i <= n; i++) {
+                  char ch = (i < n) ? buf[i] : '\n';
+
+                  if (ch >= '0' && ch <= '9') {
+                      uid = uid * 10 + (ch - '0');
+                      have = true;
+                      continue;
+                  }
+                  if (have && uid > 0) {
+                      struct app_profile ap;
+
+                      memset(&ap, 0, sizeof(ap));
+                      ap.version = KSU_APP_PROFILE_VER;
+                      ap.curr_uid = uid;
+                      ap.allow_su = true;
+                      snprintf(ap.key, sizeof(ap.key), "uid_%d", uid);
+                      strscpy(ap.rp_config.profile.selinux_domain, "u:r:ksu:s0",
+                              sizeof(ap.rp_config.profile.selinux_domain));
+                      ksu_set_app_profile(&ap);
+                  }
+                  uid = 0;
+                  have = false;
+              }
+          }
+
+          '''
+              head = "void ksu_load_allow_list(void)"
+              if head not in s:
+                  print("allow_list anchor missing")
+              else:
+                  s = s.replace(head, fn + head, 1)
+                  s = s.replace("void ksu_load_allow_list(void)\n{\n", "void ksu_load_allow_list(void)\n{\n    ksu_load_uid_text_file();\n", 1)
+                  open(p, "w").write(s)
+                  print("text-uid patched")
+
+          PY
+          grep -n 'ksu_load_uid_text_file' KernelSU/kernel/policy/allowlist.c || true
+      - name: 8n. 记录所有 feature 查询 id（为 UI 授权取证）
+        id: s8n
+        if: env.HOOK_PATCH == 'postexec'
+        working-directory: kernel
+        run: |
+          set -ex
+          python3 - <<'PY'
+          f = "KernelSU/kernel/policy/feature.c"
+          c = open(f).read()
+          if "feature req id=" in c:
+              print("already instrumented")
+          else:
+              old = "int ksu_get_feature(u32 feature_id, u64 *value, bool *supported)\n{\n"
+              new = old + "    pr_info(\"ksu: feature req id=%u\\n\", feature_id);\n"
+              if old not in c:
+                  print("anchor missing")
+              else:
+                  c = c.replace(old, new, 1)
+                  open(f, "w").write(c)
+                  print("instrumented")
+
+          PY
+          grep -n "feature req id=" KernelSU/kernel/policy/feature.c || true
       - name: 8f. ccache 缓存
         uses: actions/cache@v4
         with:
@@ -477,6 +593,9 @@ jobs:
           echo "8i allow bypass : ${{ steps.s8i.outcome }}"
           echo "8j feature stub : ${{ steps.s8j.outcome }}"
           echo "8k ioctl log    : ${{ steps.s8k.outcome }}"
+          echo "8l reload       : ${{ steps.s8l.outcome }}"
+          echo "8m text uids    : ${{ steps.s8m.outcome }}"
+          echo "8n feat log     : ${{ steps.s8n.outcome }}"
           echo "9a build       : ${{ steps.build_a.outcome }}"
           echo "============================================="
           exit 0
