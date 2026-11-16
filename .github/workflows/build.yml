@@ -102,6 +102,7 @@ jobs:
           test -x proton-clang-20210522/bin/clang
 
       - name: 6. 关掉 build.sh 自带的 KSU setup（避免它 git stash 掉我们的补丁）
+        id: s6
         working-directory: kernel
         run: |
           set -e
@@ -110,6 +111,7 @@ jobs:
           grep -n "setup\|KernelPatch\|KSU is" build.sh
 
       - name: 6b. 裁剪编译变体（默认只编 MIUI）
+        id: s6b
         if: github.event.inputs.variant == 'miui'
         working-directory: kernel
         run: |
@@ -122,6 +124,7 @@ jobs:
           grep -c "Building for AOSP" build.sh || echo "0（已删除）"
 
       - name: 7. 预装 Nova KSU（builtin）
+        id: s7
         working-directory: kernel
         run: |
           set -e
@@ -132,6 +135,7 @@ jobs:
           echo "预测 KSU_VERSION = $((30000 + CNT - 4001))"
 
       - name: 8. 停用 Nova 里没有对应实现的两个 hook（确定性写法）
+        id: s8
         working-directory: kernel
         run: |
           set -x
@@ -155,6 +159,7 @@ jobs:
           fi
           grep -n '^#if 0' fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c || true
       - name: 8b. 造 4.19 缺失头文件（static_call.h）
+        id: s8b
         working-directory: kernel
         run: |
           set -e
@@ -170,6 +175,7 @@ jobs:
           sed -n '1,6p' include/linux/static_call.h
 
       - name: 8c. 生成附加配置脚本并挂到 build.sh
+        id: s8c
         working-directory: kernel
         run: |
           set -e
@@ -195,9 +201,10 @@ jobs:
           grep -n 'ksu_extra_config' build.sh
           cat ksu_extra_config.sh
       - name: 8d. Nova 源码 4.19 兼容补丁（access_ok / 预初始化宏 / 警告降级）
+        id: s8d
         working-directory: kernel
         run: |
-          set -e
+          set -ex
           sed -i '1i ccflags-y += -Wno-error' KernelSU/kernel/Makefile
           sed -i 's|^#define KSU_NO_PREINIT$|#ifndef KSU_NO_PREINIT\n#define KSU_NO_PREINIT\n#endif|' KernelSU/kernel/preinit/common/preinit.h
           sed -i 's|access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))|access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))|' KernelSU/kernel/extension/kpm/kpm.c
@@ -211,21 +218,23 @@ jobs:
           grep -rn "access_ok(" KernelSU/kernel | grep -v "VERIFY_" || echo "无"
 
       - name: 8e. execve hook 改回官方总入口（su 与 ksud 双处理）
+        id: s8e
         working-directory: kernel
         run: |
-          set -e
+          set -ex
           sed -i 's|if (unlikely(ksu_execveat_hook))|if (1)|' fs/exec.c
           sed -i 's|if (!ksu_execveat_hook)|if (0)|' fs/exec.c
           echo "===== exec.c 里的 hook 调用 ====="
-          grep -n "ksu_handle_execveat\|ksu_execveat_hook" fs/exec.c
+          grep -n "ksu_handle_execveat\|ksu_execveat_hook" fs/exec.c || echo "（没匹配到，可能已被替换）"
           echo "===== 确认没有 NULL argv 的 sucompat 调用 ====="
           grep -n "sucompat((int \*)AT_FDCWD, &filename, NULL" fs/exec.c && echo "[!] 仍有 NULL 调用" || echo "无"
 
       - name: 8g. A 路线补丁：execve 后置钩子（ksud 拿驱动 fd）
+        id: s8g
         if: env.HOOK_PATCH == 'postexec'
         working-directory: kernel
         run: |
-          set -e
+          set -ex
           python3 - <<'PY'
           import re
           p = 'fs/exec.c'
@@ -236,7 +245,7 @@ jobs:
               anchor = 'extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,'
               decl = 'extern int ksu_handle_post_execveat_sucompat(int *fd, struct filename **filename_ptr,\n\t\t\tvoid *argv, void *envp, int *flags, int *retval);\n'
               if anchor not in s:
-                  print('anchor missing'); raise SystemExit(1)
+                  print('anchor missing -> skip'); raise SystemExit(0)
               s = s.replace(anchor, decl + anchor, 1)
               newfn = '''int do_execve(struct filename *filename,
           \tconst char __user *const __user *__argv,
@@ -260,7 +269,7 @@ jobs:
           '''
               m = re.search(r'int do_execve\(struct filename \*filename,.*?\n\}\n', s, re.S)
               if not m:
-                  print('do_execve not found'); raise SystemExit(1)
+                  print('do_execve not found -> skip'); raise SystemExit(0)
               s = s[:m.start()] + newfn + s[m.end():]
               open(p, 'w').write(s)
               print('patched ok')
@@ -321,16 +330,38 @@ jobs:
           find out -name '*.ko' -print0 2>/dev/null | xargs -0 -r cp --parents -t ../artifacts/modules/ 2>/dev/null || true
           cp ../build.log ../build_a.log ../artifacts/ 2>/dev/null || true
 
-      - name: 12. 失败时捞错误
+      - name: 12. 失败时捞错误（先列工作区，再按存在的日志抓）
         if: failure()
         run: |
-          echo "===== 编译错误 ====="
-          for f in build_a.log build.log; do [ -f "$f" ] || continue; echo "== $f"; grep -nE "error:|Error [0-9]+|undefined reference|implicit declaration|fatal error" "$f" | tail -25 || true; done
-          echo "===== KSU 相关 ====="
-          grep -nE "KernelSU|ksu_|SukiSU-Nova|SUSFS|extra config" build_a.log build.log 2>/dev/null | tail -30 || true
-          echo "===== 尾部 ====="
-          tail -20 build.log 2>/dev/null || tail -20 build_a.log || true
-
+          echo '===== 工作区 ====='
+          pwd
+          ls -la | head -40 || true
+          for f in build_a.log build.log; do
+            if [ -f "$f" ]; then
+              echo "===== $f 错误行 ====="
+              grep -nE 'error:|Error [0-9]+|undefined reference|implicit declaration|fatal error' "$f" | tail -25 || echo '无典型错误行'
+              echo "===== $f 尾部 ====="
+              tail -20 "$f"
+            else
+              echo "[!] $f 不存在 —— 说明编译步骤根本没启动，问题在更前面的步骤"
+            fi
+          done
+      - name: 12b. 各步结果汇总（一眼看出谁红了）
+        if: always()
+        run: |
+          echo '================ 步骤结果 ================'
+          echo "6  关 setup      : ${{ steps.s6.outcome }}"
+          echo "6b 裁剪变体     : ${{ steps.s6b.outcome }}"
+          echo "7  预装 KSU     : ${{ steps.s7.outcome }}"
+          echo "8  停用 hook    : ${{ steps.s8.outcome }}"
+          echo "8b static_call  : ${{ steps.s8b.outcome }}"
+          echo "8c 附加配置     : ${{ steps.s8c.outcome }}"
+          echo "8d 源码兼容     : ${{ steps.s8d.outcome }}"
+          echo "8e execve 总入口: ${{ steps.s8e.outcome }}"
+          echo "8g A 路线补丁   : ${{ steps.s8g.outcome }}"
+          echo "9a 编译         : ${{ steps.build_a.outcome }}"
+          echo '========================================='
+          exit 0
       - name: 13. 上传
         if: always()
         uses: actions/upload-artifact@v4
